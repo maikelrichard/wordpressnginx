@@ -1,34 +1,26 @@
-{{
-	def is_alpine:
-		env.variant | index("alpine")
--}}
+# Definir base de imagem PHP com a versão desejada
 FROM php:{{ env.phpVersion }}-{{ env.variant }}
 
 {{ if env.version != "cli" then ( -}}
-# persistent dependencies
+# Dependências persistentes
 {{ if is_alpine then ( -}}
 RUN set -eux; \
 	apk add --no-cache \
-# in theory, docker-entrypoint.sh is POSIX-compliant, but priority is a working, consistent image
 		bash \
-# Ghostscript is required for rendering PDF previews
 		ghostscript \
-# Alpine package for "imagemagick" contains ~120 .so files, see: https://github.com/docker-library/wordpress/pull/497
 		imagemagick \
 	;
 {{ ) else ( -}}
 RUN set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends \
-# Ghostscript is required for rendering PDF previews
 		ghostscript \
 	; \
 	rm -rf /var/lib/apt/lists/*
 {{ ) end -}}
 {{ ) else ( -}}
-# install wp-cli dependencies
+# Instalar dependências do wp-cli
 RUN apk add --no-cache \
-# bash is needed for 'wp shell': https://github.com/wp-cli/shell-command/blob/b8dafcc2a2eba5732fdee70be077675a302848e9/src/WP_CLI/REPL.php#L104
 		bash \
 		less \
 		mysql-client
@@ -39,10 +31,9 @@ RUN set -ex; \
 WORKDIR /var/www/html
 {{ ) end -}}
 
-# install the PHP extensions we need (https://make.wordpress.org/hosting/handbook/handbook/server-environment/#php-extensions)
+# Instalar as extensões PHP necessárias
 RUN set -ex; \
-	\
-{{ if is_alpine then ( -}}
+	{{ if is_alpine then ( -}}
 	apk add --no-cache --virtual .build-deps \
 		$PHPIZE_DEPS \
 		freetype-dev \
@@ -54,9 +45,8 @@ RUN set -ex; \
 		libwebp-dev \
 		libzip-dev \
 	; \
-{{ ) else ( -}}
+	{{ ) else ( -}}
 	savedAptMark="$(apt-mark showmanual)"; \
-	\
 	apt-get update; \
 	apt-get install -y --no-install-recommends \
 		libavif-dev \
@@ -84,71 +74,18 @@ RUN set -ex; \
 		mysqli \
 		zip \
 	; \
-{{ if is_alpine then ( -}}
-# WARNING: imagick is likely not supported on Alpine: https://github.com/Imagick/imagick/issues/328
-{{ ) else "" end -}}
-# https://pecl.php.net/package/imagick
-{{ if true then ( -}}
-# https://github.com/Imagick/imagick/commit/5ae2ecf20a1157073bad0170106ad0cf74e01cb6 (causes a lot of build failures, but strangely only intermittent ones 🤔)
-# see also https://github.com/Imagick/imagick/pull/641
-# this is "pecl install imagick-3.7.0", but by hand so we can apply a small hack / part of the above commit
-	curl -fL -o imagick.tgz 'https://pecl.php.net/get/imagick-3.7.0.tgz'; \
-	echo '5a364354109029d224bcbb2e82e15b248be9b641227f45e63425c06531792d3e *imagick.tgz' | sha256sum -c -; \
-	tar --extract --directory /tmp --file imagick.tgz imagick-3.7.0; \
-	grep '^//#endif$' /tmp/imagick-3.7.0/Imagick.stub.php; \
-	test "$(grep -c '^//#endif$' /tmp/imagick-3.7.0/Imagick.stub.php)" = '1'; \
-	sed -i -e 's!^//#endif$!#endif!' /tmp/imagick-3.7.0/Imagick.stub.php; \
-	grep '^//#endif$' /tmp/imagick-3.7.0/Imagick.stub.php && exit 1 || :; \
-	docker-php-ext-install /tmp/imagick-3.7.0; \
-	rm -rf imagick.tgz /tmp/imagick-3.7.0; \
-{{ # TODO when imagick has another release, we should ditch this whole block and just update instead -}}
-{{ ) else ( -}}
-	pecl install imagick-3.7.0; \
+# Instalar imagick
+RUN pecl install imagick-3.7.0; \
 	docker-php-ext-enable imagick; \
 	rm -r /tmp/pear; \
-{{ ) end -}}
 	\
-# some misbehaving extensions end up outputting to stdout 🙈 (https://github.com/docker-library/wordpress/issues/669#issuecomment-993945967)
+	# Garantir que as extensões estão corretamente carregadas
 	out="$(php -r 'exit(0);')"; \
 	[ -z "$out" ]; \
 	err="$(php -r 'exit(0);' 3>&1 1>&2 2>&3)"; \
 	[ -z "$err" ]; \
-	\
-	extDir="$(php -r 'echo ini_get("extension_dir");')"; \
-	[ -d "$extDir" ]; \
-{{ if is_alpine then ( -}}
-	runDeps="$( \
-		scanelf --needed --nobanner --format '%n#p' --recursive "$extDir" \
-			| tr ',' '\n' \
-			| sort -u \
-			| awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
-	)"; \
-	apk add --no-network --virtual .wordpress-phpexts-rundeps $runDeps; \
-	apk del --no-network .build-deps; \
-{{ ) else ( -}}
-# reset apt-mark's "manual" list so that "purge --auto-remove" will remove all build dependencies
-	apt-mark auto '.*' > /dev/null; \
-	apt-mark manual $savedAptMark; \
-	ldd "$extDir"/*.so \
-		| awk '/=>/ { so = $(NF-1); if (index(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); printf "*%s\n", so }' \
-		| sort -u \
-		| xargs -r dpkg-query --search \
-		| cut -d: -f1 \
-		| sort -u \
-		| xargs -rt apt-mark manual; \
-	\
-	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
-	rm -rf /var/lib/apt/lists/*; \
-{{ ) end -}}
-	\
-	! { ldd "$extDir"/*.so | grep 'not found'; }; \
-# check for output like "PHP Warning:  PHP Startup: Unable to load dynamic library 'foo' (tried: ...)
-	err="$(php --version 3>&1 1>&2 2>&3)"; \
-	[ -z "$err" ]
 
-# set recommended PHP.ini settings
-{{ if env.version != "cli" then ( -}}
-# see https://secure.php.net/manual/en/opcache.installation.php
+# Configuração recomendada para o PHP (Opcache)
 RUN set -eux; \
 	docker-php-ext-enable opcache; \
 	{ \
@@ -157,14 +94,9 @@ RUN set -eux; \
 		echo 'opcache.max_accelerated_files=4000'; \
 		echo 'opcache.revalidate_freq=2'; \
 	} > /usr/local/etc/php/conf.d/opcache-recommended.ini
-{{ ) else ( -}}
-# excluding opcache due https://github.com/docker-library/wordpress/issues/407
-{{ ) end -}}
-# https://wordpress.org/support/article/editing-wp-config-php/#configure-error-logging
 
+# Configurações para logs de erro do PHP
 RUN { \
-    # https://www.php.net/manual/en/errorfunc.constants.php
-    # https://github.com/docker-library/wordpress/issues/420#issuecomment-517839670
     echo 'error_reporting = E_ERROR | E_WARNING | E_PARSE | E_CORE_ERROR | E_CORE_WARNING | E_COMPILE_ERROR | E_COMPILE_WARNING | E_RECOVERABLE_ERROR'; \
     echo 'display_errors = Off'; \
     echo 'display_startup_errors = Off'; \
@@ -176,77 +108,56 @@ RUN { \
     echo 'html_errors = Off'; \
 } > /usr/local/etc/php/conf.d/error-logging.ini
 
-# Configuração para o Nginx
+# Instalar o Nginx
 RUN set -eux; \
-    # Install necessary packages for Nginx
-    apt-get update && apt-get install -y nginx; \
-    \
-    # Configure Nginx to serve WordPress
-    { \
-        echo 'server {'; \
-        echo '    listen 80 default_server;' \
-        echo '    root /var/www/html;' \
-        echo '    index index.php index.html index.htm;' \
-        echo '    server_name _;' \
-        echo '    location / {'; \
-        echo '        try_files $uri $uri/ /index.php?$args;'; \
-        echo '    }'; \
-        echo '    location ~ \.php$ {'; \
-        echo '        include snippets/fastcgi-php.conf;' \
-        echo '        fastcgi_pass 127.0.0.1:9000;' \
-        echo '        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;' \
-        echo '        include fastcgi_params;' \
-        echo '    }'; \
-        echo '}'; \
-    } > /etc/nginx/sites-available/default; \
-    \
-    # Enable and start Nginx
-    service nginx start
+	apt-get update && apt-get install -y nginx; \
+	# Configurar o Nginx para servir o WordPress
+	{ \
+		echo 'server {'; \
+		echo '    listen 80 default_server;' \
+		echo '    root /var/www/html;' \
+		echo '    index index.php index.html index.htm;' \
+		echo '    server_name _;' \
+		echo '    location / {'; \
+		echo '        try_files $uri $uri/ /index.php?$args;'; \
+		echo '    }'; \
+		echo '    location ~ \.php$ {'; \
+		echo '        include snippets/fastcgi-php.conf;' \
+		echo '        fastcgi_pass 127.0.0.1:9000;' \
+		echo '        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;' \
+		echo '        include fastcgi_params;' \
+		echo '    }'; \
+		echo '}'; \
+	} > /etc/nginx/sites-available/default; \
+	\
+	# Habilitar e iniciar o Nginx
+	service nginx start
 
+# Baixar e instalar o WordPress
 RUN set -eux; \
     version={{ .upstream | @sh }}; \
     sha1={{ .sha1 | @sh }}; \
-    \
     curl -o wordpress.tar.gz -fL "https://wordpress.org/wordpress-$version.tar.gz"; \
     echo "$sha1 *wordpress.tar.gz" | sha1sum -c -; \
-    \
-    # upstream tarballs include ./wordpress/ so this gives us /usr/src/wordpress
     tar -xzf wordpress.tar.gz -C /usr/src/; \
     rm wordpress.tar.gz; \
     \
-    # https://wordpress.org/support/article/htaccess/
+    # Configuração do arquivo .htaccess para o WordPress
     [ ! -e /usr/src/wordpress/.htaccess ]; \
     { \
         echo '# BEGIN WordPress'; \
         echo ''; \
         echo 'RewriteEngine On'; \
         echo 'RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]'; \
-        echo 'RewriteBase /'; \
-        echo 'RewriteRule ^index\.php$ - [L]'; \
-        echo 'RewriteCond %{REQUEST_FILENAME} !-f'; \
-        echo 'RewriteCond %{REQUEST_FILENAME} !-d'; \
-        echo 'RewriteRule . /index.php [L]'; \
-        echo ''; \
-        echo '# END WordPress'; \
-    } > /usr/src/wordpress/.htaccess; \
-    \
-    chown -R www-data:www-data /usr/src/wordpress; \
-    # pre-create wp-content (and single-level children) for folks who want to bind-mount themes, etc so permissions are pre-created properly instead of root:root
-    # wp-content/cache: https://github.com/docker-library/wordpress/issues/534#issuecomment-705733507
-    mkdir wp-content; \
-    for dir in /usr/src/wordpress/wp-content/*/ cache; do \
-        dir="$(basename "${dir%/}")"; \
-        mkdir "wp-content/$dir"; \
-    done; \
-    chown -R www-data:www-data wp-content; \
-    chmod -R 1777 wp-content
+    } > /usr/src/wordpress/.htaccess
 
-VOLUME /var/www/html
+# Copiar o WordPress para o diretório de trabalho
+RUN cp -a /usr/src/wordpress/. /var/www/html/; \
+    chown -R www-data:www-data /var/www/html; \
+    chmod -R 755 /var/www/html
 
-# Adicionar configuração wp-config-docker.php para WordPress
-COPY --chown=www-data:www-data wp-config-docker.php /usr/src/wordpress/
+# Expor a porta 80
+EXPOSE 80
 
-COPY docker-entrypoint.sh /usr/local/bin/
-
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["php-fpm"]
+# Iniciar o Nginx e o PHP-FPM
+CMD ["bash", "-c", "service nginx start && php-fpm"]
